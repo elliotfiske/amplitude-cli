@@ -6,9 +6,15 @@
  * The MCP server exposes tools via JSON-RPC over HTTP (Streamable HTTP transport).
  */
 
+import { createRequire } from "node:module";
+
 import { getAccessToken, getMcpBaseUrl, getOAuthConfig } from "./utils/oauth.js";
 
-export const CLI_VERSION = "0.3.2";
+// Single source of truth for the version: package.json. Hardcoding it here
+// lets `amp --version` and the MCP clientInfo drift from the published version.
+const { version } = createRequire(import.meta.url)("../package.json") as { version: string };
+
+export const CLI_VERSION: string = version;
 
 export interface McpToolResult {
   content: Array<{
