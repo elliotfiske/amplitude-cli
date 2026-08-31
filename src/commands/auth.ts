@@ -27,16 +27,31 @@ export function registerAuthCommands(program: Command): void {
           `Scopes: ${oauthConfig.tokens.scope || "mcp:read mcp:write offline_access"}`
         );
 
-        // Verify by getting context
+        // Verify the token actually works by reading org/project context.
         try {
           const mcp = new AmplitudeMcpClient({ region: oauthConfig.region });
-          const ctx = await mcp.getContext();
-          const text = ctx.content?.[0]?.text;
-          if (text) {
-            console.error(`\nProject context:\n${text.slice(0, 200)}`);
+          const ctx = extractMcpText(await mcp.getContext()) as any;
+          const org = ctx?.org?.name;
+          const email = ctx?.user?.email;
+          const projects: Array<{ appId?: string; appName?: string }> = ctx?.projects ?? [];
+          const defaultAppId = ctx?.user?.defaultAppId;
+
+          if (org || email) {
+            console.error(`\nOrg: ${org ?? "unknown"}${email ? `  (${email})` : ""}`);
           }
-        } catch {
+          if (projects.length) {
+            const preview = projects
+              .slice(0, 5)
+              .map((p) => `  ${p.appId === defaultAppId ? "*" : " "} ${p.appId}  ${p.appName}`)
+              .join("\n");
+            console.error(`Projects (${projects.length}, * = default):\n${preview}`);
+            if (projects.length > 5) {
+              console.error(`  … run 'amp auth context' for the full list`);
+            }
+          }
+        } catch (err) {
           console.error("\n(Could not verify MCP connection — tokens saved anyway)");
+          if (err instanceof Error) console.error(`  ${err.message}`);
         }
       } catch (err) {
         if (err instanceof Error) {
@@ -125,6 +140,26 @@ export function registerAuthCommands(program: Command): void {
       }
 
       output(status, opts.format as OutputFormat);
+    });
+
+  // ─── Context ────────────────────────────────────────────────────────
+
+  auth
+    .command("context")
+    .description("Show org, user, and accessible projects (get_amplitude_context)")
+    .option("--project-id <id>", "Fetch one project's settings instead of the org overview")
+    .option("-f, --format <format>", "Output format: json, compact, csv", "json")
+    .action(async (opts) => {
+      try {
+        const mcp = new AmplitudeMcpClient();
+        const projectId = opts.projectId ?? program.opts().projectId;
+        const result = await mcp.getContext(
+          projectId !== undefined ? parseInt(String(projectId), 10) : undefined
+        );
+        output(extractMcpText(result), opts.format as OutputFormat);
+      } catch (err) {
+        handleError(err);
+      }
     });
 
   // ─── MCP tools listing ──────────────────────────────────────────────
