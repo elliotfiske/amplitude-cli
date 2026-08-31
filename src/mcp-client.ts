@@ -1,9 +1,11 @@
 /**
  * Amplitude MCP client.
- * Calls Amplitude's MCP server tools (search, query_dataset, save_chart_edits,
- * create_dashboard, etc.) using OAuth tokens.
  *
  * The MCP server exposes tools via JSON-RPC over HTTP (Streamable HTTP transport).
+ *
+ * Tool names below track Amplitude's current consolidated surface: a handful of
+ * multiplexer tools that take an `action`/`include` discriminator rather than one
+ * tool per verb. Run `amp tools list` to see the live surface.
  */
 
 import { createRequire } from "node:module";
@@ -46,8 +48,10 @@ export class AmplitudeMcpClient {
   }
 
   /**
-   * Resolve the project ID. Uses explicit value, env var, or auto-discovers
-   * from get_context and caches the result.
+   * Resolve the project ID (Amplitude calls it appId).
+   *
+   * Order: explicit constructor arg / --project-id, then AMPLITUDE_PROJECT_ID,
+   * then auto-discovery from get_amplitude_context. Result is cached per client.
    */
   async getProjectId(): Promise<string | undefined> {
     if (this.projectId) return this.projectId;
@@ -55,24 +59,40 @@ export class AmplitudeMcpClient {
 
     try {
       const ctx = await this.getContext();
-      const text = ctx.content?.find((c) => c.type === "text")?.text;
-      if (text) {
-        const parsed = JSON.parse(text);
+      const parsed = parseToolJson(ctx);
+      if (parsed && typeof parsed === "object") {
+        const o = parsed as Record<string, any>;
+        // get_amplitude_context (org route) returns { user: { defaultAppId }, projects: [{ appId }] }.
         const id =
-          parsed?.appId ??
-          parsed?.projectId ??
-          parsed?.project_id ??
-          parsed?.projects?.[0]?.appId ??
-          parsed?.projects?.[0]?.id;
+          o.user?.defaultAppId ??
+          o.projects?.[0]?.appId ??
+          o.appId ??
+          o.projectId;
         if (id) {
           this.cachedProjectId = String(id);
           return this.cachedProjectId;
         }
       }
     } catch {
-      // Auto-discovery failed; proceed without projectId
+      // Auto-discovery failed; caller decides whether a project is mandatory.
     }
     return undefined;
+  }
+
+  /**
+   * Like getProjectId, but throws a actionable error instead of returning
+   * undefined. Most of the current tool surface requires an explicit projectId.
+   */
+  async requireProjectId(): Promise<string> {
+    const pid = await this.getProjectId();
+    if (!pid) {
+      throw new Error(
+        "Could not determine an Amplitude project ID.\n" +
+          "Pass --project-id <id>, set AMPLITUDE_PROJECT_ID, or run " +
+          "`amp auth context` to see the projects you can access."
+      );
+    }
+    return pid;
   }
 
   /**
@@ -299,131 +319,411 @@ export class AmplitudeMcpClient {
     return res.json();
   }
 
-  // ─── Convenience methods for common MCP tools ─────────────────────────
+  // ─── Convenience wrappers over the live tool surface ──────────────────
+  //
+  // Each wrapper names the real tool it calls. When Amplitude changes the
+  // surface again, `amp tools list` / `amp tools describe <name>` is the
+  // source of truth and only this section should need to move.
+
+  // -- context -----------------------------------------------------------
+
+  /** get_amplitude_context — org + project list, or one project's settings. */
+  async getContext(projectId?: number): Promise<McpToolResult> {
+    return this.callTool("get_amplitude_context", {
+      ...(projectId !== undefined && { projectId }),
+      rationale: "amp CLI: resolve org/project context",
+    });
+  }
+
+  // -- search ------------------------------------------------------------
 
   /**
-   * Search for entities (charts, dashboards, events, cohorts, etc.)
+   * search_amp_entities — find saved entities (charts, dashboards, cohorts,
+   * experiments, …) by name. Note: `queries` is an array and the per-query cap
+   * is `limitPerQuery`, not `limit`.
    */
-  async search(
-    query: string,
-    entityTypes?: string[],
-    limit?: number
-  ): Promise<McpToolResult> {
-    return this.callTool("search", {
-      query,
-      ...(entityTypes && { entityTypes }),
-      ...(limit && { limit }),
+  async searchEntities(opts: {
+    query?: string;
+    entityTypes?: string[];
+    limit?: number;
+    appIds?: string[];
+    sortOrder?: string;
+    semanticSearch?: boolean;
+  }): Promise<McpToolResult> {
+    return this.callTool("search_amp_entities", {
+      ...(opts.query ? { queries: [opts.query] } : {}),
+      ...(opts.entityTypes && { entityTypes: opts.entityTypes }),
+      ...(opts.limit !== undefined && { limitPerQuery: opts.limit }),
+      ...(opts.appIds && { appIds: opts.appIds }),
+      ...(opts.sortOrder && { sortOrder: opts.sortOrder }),
+      ...(opts.semanticSearch !== undefined && { semanticSearch: opts.semanticSearch }),
+      rationale: "amp CLI: entity search",
     });
   }
 
   /**
-   * Get context (project info, user info).
+   * search_amp_data_taxonomy — semantic discovery over events, properties and
+   * property values. Requires projectId and a batch of `searches`.
    */
-  async getContext(): Promise<McpToolResult> {
-    return this.callTool("get_context");
+  async searchTaxonomy(
+    searches: Array<Record<string, unknown>>,
+    opts?: { projectId?: string; detail?: "compact" | "stats" | "full" }
+  ): Promise<McpToolResult> {
+    const projectId = opts?.projectId ?? (await this.requireProjectId());
+    return this.callTool("search_amp_data_taxonomy", {
+      projectId,
+      searches,
+      ...(opts?.detail && { detail: opts.detail }),
+      rationale: "amp CLI: taxonomy search",
+    });
   }
 
-  /**
-   * Get chart definitions by ID.
-   */
+  // -- events & properties -----------------------------------------------
+
+  /** manage_amp_events (action=get) — list/hydrate tracking-plan events. */
+  async getEvents(opts?: {
+    projectId?: string;
+    eventTypes?: string[];
+    limit?: number;
+    cursor?: string;
+    includeDeleted?: boolean;
+  }): Promise<McpToolResult> {
+    const projectId = opts?.projectId ?? (await this.requireProjectId());
+    return this.callTool("manage_amp_events", {
+      action: "get",
+      kind: "event",
+      projectId,
+      ...(opts?.eventTypes && { eventTypes: opts.eventTypes }),
+      ...(opts?.limit !== undefined && { limit: opts.limit }),
+      ...(opts?.cursor && { cursor: opts.cursor }),
+      ...(opts?.includeDeleted !== undefined && { includeDeleted: opts.includeDeleted }),
+      rationale: "amp CLI: list events",
+    });
+  }
+
+  /** get_properties (propertyType=event) — properties for one event, or project-wide. */
+  async getEventProperties(
+    eventType?: string,
+    opts?: { projectId?: string; limit?: number; cursor?: string }
+  ): Promise<McpToolResult> {
+    const projectId = opts?.projectId ?? (await this.requireProjectId());
+    return this.callTool("get_properties", {
+      propertyType: "event",
+      projectId,
+      ...(eventType ? { eventType } : {}),
+      ...(opts?.limit !== undefined && { limit: opts.limit }),
+      ...(opts?.cursor && { cursor: opts.cursor }),
+      rationale: "amp CLI: event properties",
+    });
+  }
+
+  /** get_properties (propertyType=user). */
+  async getUserProperties(opts?: {
+    projectId?: string;
+    name?: string;
+    limit?: number;
+  }): Promise<McpToolResult> {
+    const projectId = opts?.projectId ?? (await this.requireProjectId());
+    return this.callTool("get_properties", {
+      propertyType: "user",
+      projectId,
+      ...(opts?.name ? { name: opts.name } : {}),
+      ...(opts?.limit !== undefined && { limit: opts.limit }),
+      rationale: "amp CLI: user properties",
+    });
+  }
+
+  // -- charts ------------------------------------------------------------
+
+  /** get_amplitude_charts (include=definition) — raw saved chart config. */
   async getCharts(chartIds: string[]): Promise<McpToolResult> {
-    return this.callTool("get_charts", { chartIds });
+    return this.callTool("get_amplitude_charts", {
+      chartIds,
+      include: "definition",
+    });
+  }
+
+  /** get_amplitude_charts (include=typed) — UI-shaped params, editable + replayable. */
+  async getChartTyped(chartIds: string[]): Promise<McpToolResult> {
+    return this.callTool("get_amplitude_charts", { chartIds, include: "typed" });
+  }
+
+  /** get_amplitude_charts (include=link) — just the chart URL(s). */
+  async getChartLinks(chartIds: string[]): Promise<McpToolResult> {
+    return this.callTool("get_amplitude_charts", { chartIds, include: "link" });
   }
 
   /**
-   * Get dashboard by ID.
+   * get_amplitude_charts (include=data) — run saved charts or chart edits.
+   * Max 3 ids/edits combined, per the tool contract.
    */
-  async getDashboard(dashboardId: string): Promise<McpToolResult> {
-    return this.callTool("get_dashboard", { dashboardId });
+  async getChartData(opts: {
+    chartIds?: string[];
+    chartEditIds?: string[];
+    groupByLimit?: number;
+    timeSeriesLimit?: number;
+    excludeIncompleteDatapoints?: boolean;
+  }): Promise<McpToolResult> {
+    return this.callTool("get_amplitude_charts", {
+      include: "data",
+      ...(opts.chartIds && { chartIds: opts.chartIds }),
+      ...(opts.chartEditIds && { chartEditIds: opts.chartEditIds }),
+      ...(opts.groupByLimit !== undefined && { groupByLimit: opts.groupByLimit }),
+      ...(opts.timeSeriesLimit !== undefined && { timeSeriesLimit: opts.timeSeriesLimit }),
+      ...(opts.excludeIncompleteDatapoints !== undefined && {
+        excludeIncompleteDatapoints: opts.excludeIncompleteDatapoints,
+      }),
+    });
   }
 
   /**
-   * Query a dataset (create/preview a chart).
-   * Returns data + an editId that can be saved.
+   * get_amplitude_charts (include=guide) — parameter schema, valid enums and a
+   * working example for a chart type. Omit chartType to list supported types.
    */
-  async queryDataset(
+  async getChartGuide(chartType?: string): Promise<McpToolResult> {
+    return this.callTool("get_amplitude_charts", {
+      include: "guide",
+      ...(chartType ? { chartType } : {}),
+    });
+  }
+
+  // -- ad-hoc queries ----------------------------------------------------
+
+  /**
+   * query_amplitude_data with the typed `chart` parameter (the preferred path).
+   * Returns the data plus a `chartEditId` that can be rendered or attached to a
+   * dashboard.
+   */
+  async queryChart(
+    chart: Record<string, unknown>,
+    opts?: {
+      projectId?: string;
+      chartId?: string;
+      groupByLimit?: number;
+      timeSeriesLimit?: number;
+      excludeIncompleteDatapoints?: boolean;
+    }
+  ): Promise<McpToolResult> {
+    const projectId = opts?.projectId ?? (await this.requireProjectId());
+    return this.callTool("query_amplitude_data", {
+      projectId,
+      chart: normalizeTypedChart(chart),
+      ...(opts?.chartId && { chartId: opts.chartId }),
+      ...(opts?.groupByLimit !== undefined && { groupByLimit: opts.groupByLimit }),
+      ...(opts?.timeSeriesLimit !== undefined && { timeSeriesLimit: opts.timeSeriesLimit }),
+      ...(opts?.excludeIncompleteDatapoints !== undefined && {
+        excludeIncompleteDatapoints: opts.excludeIncompleteDatapoints,
+      }),
+    });
+  }
+
+  /**
+   * query_amplitude_data with the raw `definition` fallback. Needed for chart
+   * types the typed model does not cover (revenueLtv, composition, …).
+   * `definition.app` is required by the server and is filled in here.
+   */
+  async queryDefinition(
     definition: Record<string, unknown>,
-    projectId?: string
+    opts?: {
+      projectId?: string;
+      groupByLimit?: number;
+      timeSeriesLimit?: number;
+      excludeIncompleteDatapoints?: boolean;
+    }
   ): Promise<McpToolResult> {
-    const pid = projectId ?? (await this.getProjectId());
-    const args: Record<string, unknown> = { definition };
-    if (pid) args.projectId = pid;
-    return this.callTool("query_dataset", args);
+    const projectId = opts?.projectId ?? (await this.requireProjectId());
+    return this.callTool("query_amplitude_data", {
+      projectId,
+      definition: { app: projectId, ...definition },
+      ...(opts?.groupByLimit !== undefined && { groupByLimit: opts.groupByLimit }),
+      ...(opts?.timeSeriesLimit !== undefined && { timeSeriesLimit: opts.timeSeriesLimit }),
+      ...(opts?.excludeIncompleteDatapoints !== undefined && {
+        excludeIncompleteDatapoints: opts.excludeIncompleteDatapoints,
+      }),
+    });
   }
 
-  /**
-   * Create a chart from a query definition.
-   */
-  async createChart(
-    definition: Record<string, unknown>,
-    projectId?: string
-  ): Promise<McpToolResult> {
-    const pid = projectId ?? (await this.getProjectId());
-    const args: Record<string, unknown> = { definition };
-    if (pid) args.projectId = pid;
-    return this.callTool("create_chart", args);
-  }
+  // -- dashboards --------------------------------------------------------
 
-  /**
-   * Save a chart from query_dataset results.
-   */
-  async saveChart(
-    editId: string,
-    name: string,
-    description?: string
-  ): Promise<McpToolResult> {
-    return this.callTool("save_chart_edits", {
-      editId,
-      name,
-      ...(description && { description }),
+  /** use_amp_dashboards (action=get) — one to three dashboards. */
+  async getDashboards(dashboardIds: string[]): Promise<McpToolResult> {
+    return this.callTool("use_amp_dashboards", {
+      action: "get",
+      dashboardIds,
+      rationale: "amp CLI: read dashboard",
     });
   }
 
   /**
-   * Create a dashboard with charts and layout.
+   * use_amp_dashboards (action=create). `rows[].chartId` accepts either a saved
+   * chart id or a chart edit id — edit ids are persisted as part of the create.
    */
-  async createDashboard(
-    name: string,
-    rows: unknown[],
-    description?: string
+  async createDashboard(opts: {
+    name: string;
+    rows: unknown[];
+    description?: string;
+    chartEdits?: unknown[];
+  }): Promise<McpToolResult> {
+    return this.callTool("use_amp_dashboards", {
+      action: "create",
+      name: opts.name,
+      rows: opts.rows,
+      ...(opts.description && { description: opts.description }),
+      ...(opts.chartEdits && { chartEdits: opts.chartEdits }),
+      rationale: "amp CLI: create dashboard",
+    });
+  }
+
+  // -- cohorts -----------------------------------------------------------
+
+  /** use_amplitude_cohorts (action=list). */
+  async listCohorts(opts?: {
+    projectId?: string;
+    query?: string;
+    limit?: number;
+  }): Promise<McpToolResult> {
+    const projectId = opts?.projectId ?? (await this.requireProjectId());
+    return this.callTool("use_amplitude_cohorts", {
+      action: "list",
+      projectId,
+      ...(opts?.query ? { query: opts.query } : {}),
+      ...(opts?.limit !== undefined && { limit: opts.limit }),
+      rationale: "amp CLI: list cohorts",
+    });
+  }
+
+  /** use_amplitude_cohorts (action=get) — max 50 ids. */
+  async getCohorts(cohortIds: string[]): Promise<McpToolResult> {
+    return this.callTool("use_amplitude_cohorts", {
+      action: "get",
+      cohortIds,
+      rationale: "amp CLI: read cohorts",
+    });
+  }
+
+  /** use_amplitude_cohorts (action=create). */
+  async createCohort(opts: {
+    name: string;
+    definition: Record<string, unknown>;
+    projectId?: string;
+    cohortType?: string;
+    cohortOwner?: string;
+  }): Promise<McpToolResult> {
+    const projectId = opts.projectId ?? (await this.requireProjectId());
+    return this.callTool("use_amplitude_cohorts", {
+      action: "create",
+      projectId,
+      name: opts.name,
+      definition: opts.definition,
+      ...(opts.cohortType && { cohortType: opts.cohortType }),
+      ...(opts.cohortOwner && { cohortOwner: opts.cohortOwner }),
+      rationale: "amp CLI: create cohort",
+    });
+  }
+
+  // -- experiments -------------------------------------------------------
+
+  /** use_amp_experiments (action=get). */
+  async getExperiments(ids: string[]): Promise<McpToolResult> {
+    return this.callTool("use_amp_experiments", {
+      action: "get",
+      ids,
+      rationale: "amp CLI: read experiments",
+    });
+  }
+
+  /** use_amp_experiments (action=analyze) — results for one experiment. */
+  async analyzeExperiment(
+    id: string,
+    opts?: { metricIds?: string[]; groupBy?: unknown[]; filters?: unknown[] }
   ): Promise<McpToolResult> {
-    return this.callTool("create_dashboard", {
-      name,
-      rows,
-      ...(description && { description }),
+    return this.callTool("use_amp_experiments", {
+      action: "analyze",
+      id,
+      ...(opts?.metricIds && { metricIds: opts.metricIds }),
+      ...(opts?.groupBy && { groupBy: opts.groupBy }),
+      ...(opts?.filters && { filters: opts.filters }),
+      rationale: "amp CLI: analyze experiment",
     });
   }
 
-  /**
-   * Get event properties for an event type.
-   */
-  async getEventProperties(eventType: string): Promise<McpToolResult> {
-    return this.callTool("get_event_properties", { eventType });
-  }
+  // -- users -------------------------------------------------------------
 
   /**
-   * Query an existing chart's data.
+   * get_amp_user_data — resolve a user and optionally return their profile or
+   * event timeline. Exactly one identifier should be supplied.
    */
-  async queryChart(chartId: string): Promise<McpToolResult> {
-    return this.callTool("query_chart", { chartId });
+  async getUserData(opts: {
+    projectId?: string;
+    amplitudeId?: string;
+    userId?: string;
+    email?: string;
+    deviceId?: string;
+    include?: "id" | "profile" | "timeline" | "both" | "org";
+    eventLimit?: number;
+    includeEventProperties?: boolean;
+    includeExperimentData?: boolean;
+    filterEvents?: string[];
+  }): Promise<McpToolResult> {
+    const args: Record<string, unknown> = {
+      ...(opts.amplitudeId && { amplitudeId: opts.amplitudeId }),
+      ...(opts.userId && { userId: opts.userId }),
+      ...(opts.email && { email: opts.email }),
+      ...(opts.deviceId && { deviceId: opts.deviceId }),
+      ...(opts.include && { include: opts.include }),
+      ...(opts.eventLimit !== undefined && { eventLimit: opts.eventLimit }),
+      ...(opts.includeEventProperties !== undefined && {
+        includeEventProperties: opts.includeEventProperties,
+      }),
+      ...(opts.includeExperimentData !== undefined && {
+        includeExperimentData: opts.includeExperimentData,
+      }),
+      ...(opts.filterEvents && { filterEvents: opts.filterEvents }),
+      rationale: "amp CLI: user lookup",
+    };
+    // projectId is required for every mode except include='org'.
+    if (opts.include !== "org") {
+      args.projectId = opts.projectId ?? (await this.requireProjectId());
+    }
+    return this.callTool("get_amp_user_data", args);
   }
+}
 
-  /**
-   * Get experiment details.
-   */
-  async getExperiments(experimentIds: string[]): Promise<McpToolResult> {
-    return this.callTool("get_experiments", {
-      experimentIds,
-    });
+/**
+ * Normalize a typed chart before sending it back to query_amplitude_data.
+ *
+ * get_amplitude_charts include='typed' emits `measured_as.as_` (trailing
+ * underscore), but query_amplitude_data only reads `measured_as.as` — and it
+ * ignores the unknown key silently rather than erroring, so a read-edit-replay
+ * round-trip would quietly fall back to unique_users. Verified against the live
+ * server: as_='event_totals' returned unique-user counts.
+ */
+function normalizeTypedChart(chart: Record<string, unknown>): Record<string, unknown> {
+  const measured = chart.measured_as;
+  if (
+    measured &&
+    typeof measured === "object" &&
+    !Array.isArray(measured) &&
+    "as_" in (measured as Record<string, unknown>) &&
+    !("as" in (measured as Record<string, unknown>))
+  ) {
+    const { as_, ...rest } = measured as Record<string, unknown>;
+    return { ...chart, measured_as: { as: as_, ...rest } };
   }
+  return chart;
+}
 
-  /**
-   * Query experiment results.
-   */
-  async queryExperiment(experimentId: string): Promise<McpToolResult> {
-    return this.callTool("query_experiment", {
-      experimentId,
-    });
+/**
+ * Pull the first JSON text block out of a tool result. Amplitude returns tool
+ * payloads as a JSON string inside content[].text.
+ */
+function parseToolJson(result: McpToolResult): unknown {
+  const text = result.content?.find((c) => c.type === "text" && c.text)?.text;
+  if (!text) return undefined;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
   }
 }
 
